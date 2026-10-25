@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router';
 import { Button, Chip, Input, Tabs, Typography } from '@openhands/ui';
 import { AppLayout } from '../components/layout/AppLayout';
 import { GateRenderer } from '../components/review/GateRenderer';
@@ -9,12 +10,10 @@ import {
   extractGateRole,
   ApiError,
   fetchOfficerQueueItems,
-  submitOfficerDecision,
 } from '../services/data';
 import {
   type PendingGate,
   type V1ApplicationStatus,
-  type V1OfficerDecisionAction,
   type V1OfficerQueueItem,
 } from '../services/api';
 import type { FieldCorrection } from '../types/approval';
@@ -22,10 +21,10 @@ import type { ExtractedField } from '../types/documents';
 
 export function ReviewConsolePage() {
   const { assessments, updateAssessment } = useAssessments();
+  const navigate = useNavigate();
   const [queueItems, setQueueItems] = useState<V1OfficerQueueItem[]>([]);
   const [queueLoading, setQueueLoading] = useState(true);
   const [queueError, setQueueError] = useState<string | null>(null);
-  const [queueActionLoading, setQueueActionLoading] = useState<string | null>(null);
   const [activeAssessmentId, setActiveAssessmentId] = useState<string | null>(null);
 
   useEffect(() => {
@@ -56,38 +55,8 @@ export function ReviewConsolePage() {
   const pendingAssessments = assessments.filter((a) => a.status === 'pending_approval');
   const completedAssessments = assessments.filter((a) => a.status === 'completed');
 
-  async function handleQueueDecision(
-    applicationId: string,
-    action: V1OfficerDecisionAction,
-  ) {
-    if (queueActionLoading) return;
-    setQueueActionLoading(`${applicationId}:${action}`);
-    try {
-      await submitOfficerDecision(
-        applicationId,
-        action,
-        action === 'approve'
-          ? 'Approved by officer via workspace queue'
-          : action === 'reject'
-            ? 'Rejected by officer via workspace queue'
-            : 'Additional information required by officer',
-      );
-      const queue = await fetchOfficerQueueItems();
-      setQueueItems(queue);
-    } catch (err) {
-      if (err instanceof ApiError) {
-        setQueueError(err.detail ?? err.message);
-      } else {
-        setQueueError('Keputusan gagal dihantar. Sila cuba lagi.');
-      }
-    } finally {
-      setQueueActionLoading(null);
-    }
-  }
-
   function queueStatusChip(status: V1ApplicationStatus): {
     color: 'gray' | 'green' | 'red' | 'primaryDark';
-
     label: string;
   } {
     if (status === 'PROCESSING') return { color: 'primaryDark', label: 'Processing' };
@@ -106,8 +75,8 @@ export function ReviewConsolePage() {
             queueItems={queueItems}
             queueLoading={queueLoading}
             queueError={queueError}
-            queueActionLoading={queueActionLoading}
-            onDecision={handleQueueDecision}
+            queueStatusChip={queueStatusChip}
+            onOpen={(id) => navigate(`/review/${id}`)}
           />
           <div className="py-10 text-center">
             <Typography.Text fontSize="m" className="text-gray-400">
@@ -126,8 +95,8 @@ export function ReviewConsolePage() {
           queueItems={queueItems}
           queueLoading={queueLoading}
           queueError={queueError}
-          queueActionLoading={queueActionLoading}
-          onDecision={handleQueueDecision}
+          queueStatusChip={queueStatusChip}
+          onOpen={(id) => navigate(`/review/${id}`)}
         />
       </div>
 
@@ -179,14 +148,14 @@ export function ReviewConsolePage() {
     queueItems,
     queueLoading,
     queueError,
-    queueActionLoading,
-    onDecision,
+    queueStatusChip,
+    onOpen,
   }: {
     queueItems: V1OfficerQueueItem[];
     queueLoading: boolean;
     queueError: string | null;
-    queueActionLoading: string | null;
-    onDecision: (applicationId: string, action: V1OfficerDecisionAction) => Promise<void>;
+    queueStatusChip: (status: V1ApplicationStatus) => { color: 'gray' | 'green' | 'red' | 'primaryDark'; label: string };
+    onOpen: (applicationId: string) => void;
   }) {
     return (
       <div className="rounded-lg border border-gray-200 bg-white p-4 shadow-sm dark:border-[#222328] dark:bg-[#131417]">
@@ -221,9 +190,6 @@ export function ReviewConsolePage() {
           <div className="space-y-3">
             {queueItems.map((item) => {
               const statusMeta = queueStatusChip(item.status);
-              const approveKey = `${item.application_id}:approve`;
-              const rejectKey = `${item.application_id}:reject`;
-              const requestInfoKey = `${item.application_id}:request_more_info`;
               return (
                 <div
                   key={item.application_id}
@@ -243,27 +209,13 @@ export function ReviewConsolePage() {
                     </Chip>
                   </div>
 
-                  <div className="mt-3 flex flex-wrap gap-2">
+                  {/* §10.4: navigate to detail page before any action — no blind decisions */}
+                  <div className="mt-3">
                     <Button
                       variant="primary"
-                      disabled={queueActionLoading !== null}
-                      onClick={() => onDecision(item.application_id, 'approve')}
+                      onClick={() => onOpen(item.application_id)}
                     >
-                      {queueActionLoading === approveKey ? 'Submitting...' : 'Approve'}
-                    </Button>
-                    <Button
-                      variant="secondary"
-                      disabled={queueActionLoading !== null}
-                      onClick={() => onDecision(item.application_id, 'reject')}
-                    >
-                      {queueActionLoading === rejectKey ? 'Submitting...' : 'Reject'}
-                    </Button>
-                    <Button
-                      variant="tertiary"
-                      disabled={queueActionLoading !== null}
-                      onClick={() => onDecision(item.application_id, 'request_more_info')}
-                    >
-                      {queueActionLoading === requestInfoKey ? 'Submitting...' : 'Request Info'}
+                      Semak Kes
                     </Button>
                   </div>
                 </div>
@@ -343,6 +295,14 @@ function AssessmentDetail({
   const [gateError, setGateError] = useState<string | null>(null);
   const [reason, setReason] = useState('');
   const [showCorrect, setShowCorrect] = useState(false);
+  const [violationAcknowledged, setViolationAcknowledged] = useState(false);
+
+  // Reset acknowledgment when gate changes
+  const isRecommendationGate = assessment.pending_gate === 'recommendation_approval';
+  const gateHasViolation =
+    isRecommendationGate &&
+    (assessment.pending_payload as { has_acknowledged_violation?: boolean } | null)
+      ?.has_acknowledged_violation === true;
   async function handleAction(
     action: 'approve' | 'reject' | 'correct',
     fieldCorrections?: FieldCorrection[],
@@ -510,8 +470,27 @@ function AssessmentDetail({
                   onChange={(e) => setReason(e.target.value)}
                   placeholder="e.g. Figures verified against source documents"
                 />
+                {/* §10.4: violation acknowledgment required before Approve at recommendation gate */}
+                {gateHasViolation && (
+                  <label className="flex cursor-pointer items-start gap-2">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5 h-4 w-4 rounded border-amber-400 text-amber-600 focus:ring-amber-500"
+                      checked={violationAcknowledged}
+                      onChange={(e) => setViolationAcknowledged(e.target.checked)}
+                    />
+                    <Typography.Text fontSize="xs" className="text-amber-700 dark:text-amber-300">
+                      I acknowledge a hard compliance violation exists and accept responsibility
+                      for approving under an exception path.
+                    </Typography.Text>
+                  </label>
+                )}
                 <div className="flex gap-3">
-                  <Button variant="primary" onClick={() => handleAction('approve')} disabled={submitting}>
+                  <Button
+                    variant="primary"
+                    onClick={() => handleAction('approve')}
+                    disabled={submitting || (gateHasViolation && !violationAcknowledged)}
+                  >
                     {submitting ? 'Submitting...' : 'Approve'}
                   </Button>
                   <Button variant="secondary" onClick={() => handleAction('reject')} disabled={submitting}>

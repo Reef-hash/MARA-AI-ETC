@@ -42,10 +42,18 @@ export function getUseMock(): boolean {
 // They are deliberately empty so no fake data is ever shown to the user.
 // All real data must come from the backend API.
 const EMPTY_QUEUE_ITEMS: V1OfficerQueueItem[] = [];
-const EMPTY_USERS: AdminUser[] = [];
-const EMPTY_ROLES: AdminRole[] = [];
-const EMPTY_AGENT_PROFILES: AgentProfile[] = [];
-const EMPTY_SYSTEM_SETTINGS: SystemSetting[] = [];
+
+/**
+ * Thrown when the UI asks for a resource whose backend endpoint does not exist
+ * yet. Callers must render an explicit "API belum tersedia" state — never an
+ * empty list that looks like real-but-empty data.
+ */
+export class ApiNotAvailableError extends Error {
+  constructor(public readonly resource: string) {
+    super(`${resource} belum tersedia`);
+    this.name = 'ApiNotAvailableError';
+  }
+}
 
 function mapV1StatusToTaskStatus(status: V1ApplicationStatus): Task['status'] {
   if (status === 'PROCESSING') return 'in_progress';
@@ -66,7 +74,8 @@ function queueItemToWorkflow(item: V1OfficerQueueItem): WorkflowInstance {
     created_at: item.updated_at,
     updated_at: item.updated_at,
     assigned_agent: 'Loan Workflow',
-    confidence: 0.92,
+    // No confidence score is exposed by /api/v1/officer/applications today.
+    // Left undefined rather than inventing 0.92 — consumers must render a dash.
   };
 }
 
@@ -112,8 +121,10 @@ export async function fetchWorkflows(): Promise<WorkflowInstance[]> {
 }
 
 export async function fetchAgentMetrics(): Promise<AgentMetric[]> {
-  // TODO: wire to GET /api/v1/admin/agent-metrics when endpoint is ready
-  return [];
+  // GET /api/v1/admin/agent-metrics does not exist yet. Throw so the dashboard
+  // can label the panel "Agent metrics belum tersedia" instead of showing an
+  // empty table that implies zero traffic.
+  throw new ApiNotAvailableError('Agent metrics');
 }
 
 export async function fetchRiskFlags(): Promise<RiskFlag[]> {
@@ -219,24 +230,27 @@ export function extractGateRole(detail: string): string | null {
 
 export { ApiError };
 
-// ─── Admin Console ─────────────────────────────────────────────
-// TODO: wire each function to real API endpoints when they are available.
-// Until then, return empty lists so no fake data is shown.
+// ─── Admin Console ───────────────────────────────────────────────────────
+// No admin endpoints exist in api.ts yet: no /api/v1/admin/users, /roles,
+// /agent-profiles or /system-settings. Each fetcher throws ApiNotAvailableError
+// so AdminConsolePage renders an explicit "API belum tersedia" banner with
+// skeletons — never silently empty tables. When the backend lands, replace the
+// throw with a `request<T>()` call in api.ts and delete the error branch.
 
 export async function fetchUsers(): Promise<AdminUser[]> {
-  return EMPTY_USERS;
+  throw new ApiNotAvailableError('Senarai pengguna');
 }
 
 export async function fetchRoles(): Promise<AdminRole[]> {
-  return EMPTY_ROLES;
+  throw new ApiNotAvailableError('Konfigurasi peranan');
 }
 
 export async function fetchAgentProfiles(): Promise<AgentProfile[]> {
-  return EMPTY_AGENT_PROFILES;
+  throw new ApiNotAvailableError('Profil ejen');
 }
 
 export async function fetchSystemSettings(): Promise<SystemSetting[]> {
-  return EMPTY_SYSTEM_SETTINGS;
+  throw new ApiNotAvailableError('Tetapan sistem');
 }
 
 // ─── Detail Application Fetch (FE-P3) ─────────────────────────

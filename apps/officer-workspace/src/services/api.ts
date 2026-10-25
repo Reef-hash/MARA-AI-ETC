@@ -1,17 +1,85 @@
-import { getAccessToken } from './auth';
+import { toast } from 'sonner';
+import { getAccessToken, logout } from './auth';
 import { API } from '../constants';
+import type { Citation } from '../types/documents';
+import type { PolicyCitation } from '../types/knowledge';
 
 const API_BASE = import.meta.env.VITE_API_GATEWAY_URL || API.BASE_PATH;
+
+/**
+ * How a failed request should be surfaced. Callers branch on `kind` rather than
+ * on raw status numbers so the mapping lives in exactly one place:
+ *
+ *   401  session gone            -> clear local session, redirect to /login
+ *   403  signed in, wrong role   -> inline permission banner, no redirect
+ *   5xx  upstream fault          -> one quiet retry, then a toast
+ *   503  known engine down       -> explicit "OCR unavailable" message
+ *   net  fetch rejected          -> network message, never a raw TypeError
+ */
+export type ApiErrorKind =
+  | 'unauthorized'
+  | 'forbidden'
+  | 'server'
+  | 'unavailable'
+  | 'http'
+  | 'network';
 
 export class ApiError extends Error {
   constructor(
     public status: number,
     message: string,
     public detail?: string,
+    public kind: ApiErrorKind = 'http',
   ) {
     super(message);
     this.name = 'ApiError';
   }
+
+  /** 403 — render an inline banner; the session itself is still valid. */
+  get isForbidden(): boolean {
+    return this.kind === 'forbidden';
+  }
+
+  /** 5xx — already retried once by `request` before this was thrown. */
+  get isServerFault(): boolean {
+    return this.kind === 'server' || this.kind === 'unavailable';
+  }
+}
+
+const SERVER_RETRY_DELAY_MS = 400;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableStatus(status: number): boolean {
+  return status >= 500 && status <= 599;
+}
+
+/**
+ * 401 handling: the session is dead (expired, revoked, wrong audience). Clear it
+ * and send the officer back to /login. Only fires when a token was actually
+ * attached — a 401 from /auth/login means bad credentials, not a dead session,
+ * and must not bounce an unauthenticated user around the app.
+ */
+function handleUnauthorized(): void {
+  toast.error('Sesi tamat. Sila log masuk semula.');
+  // logout() redirects on its own; swallow rejection so the caller still
+  // receives the ApiError and can stop its loading state.
+  void logout().catch(() => undefined);
+}
+
+function parseErrorBody(raw: unknown): { message?: string; detail?: string } {
+  if (!raw || typeof raw !== 'object') return {};
+  const body = raw as Record<string, unknown>;
+  return {
+    message: typeof body.message === 'string' ? body.message : undefined,
+    detail: typeof body.detail === 'string' ? body.detail : undefined,
+  };
+}
+
+async function readErrorBody(res: Response): Promise<{ message?: string; detail?: string }> {
+  return parseErrorBody(await res.json().catch(() => null));
 }
 
 async function request<T>(
@@ -28,31 +96,89 @@ async function request<T>(
     headers['Content-Type'] = 'application/json';
   }
 
-  const res = await fetch(`${API_BASE}${path}`, {
-    ...options,
-    headers,
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${path}`, { ...options, headers });
+  } catch (err) {
+    throw new ApiError(
+      0,
+      'Rangkaian tidak dapat dihubungi. Semak sambungan anda.',
+      err instanceof Error ? err.message : undefined,
+      'network',
+    );
+  }
+
+  // 5xx: one quiet retry. Transient gateway restarts are the common case and a
+  // single retry absorbs them without the officer seeing anything.
+  if (isRetryableStatus(res.status)) {
+    await sleep(SERVER_RETRY_DELAY_MS);
+    try {
+      res = await fetch(`${API_BASE}${path}`, { ...options, headers });
+    } catch (err) {
+      toast.error('Pelayan tidak dapat dihubungi. Sila cuba lagi.');
+      throw new ApiError(
+        0,
+        'Pelayan tidak dapat dihubungi selepas cubaan semula.',
+        err instanceof Error ? err.message : undefined,
+        'network',
+      );
+    }
+  }
+
+  if (res.status === 401) {
+    const body = await readErrorBody(res);
+    if (token) handleUnauthorized();
+    throw new ApiError(
+      401,
+      body.message ?? 'Sesi tidak sah atau telah tamat.',
+      body.detail,
+      'unauthorized',
+    );
+  }
 
   if (res.status === 403) {
-    const body = await res.json().catch(() => ({}));
-    throw new ApiError(403, 'Gate requires a different role', body.detail);
+    const body = await readErrorBody(res);
+    throw new ApiError(
+      403,
+      body.message ?? 'Peranan anda tidak dibenarkan untuk tindakan ini.',
+      body.detail,
+      'forbidden',
+    );
   }
 
   if (res.status === 503) {
-    throw new ApiError(503, 'OCR/document-classifier engine not available');
+    throw new ApiError(
+      503,
+      'Enjin OCR/klasifikasi dokumen tidak tersedia.',
+      undefined,
+      'unavailable',
+    );
+  }
+
+  if (isRetryableStatus(res.status)) {
+    const body = await readErrorBody(res);
+    toast.error('Pelayan mengalami masalah. Sila cuba lagi sebentar.');
+    throw new ApiError(
+      res.status,
+      body.message ?? body.detail ?? `Pelayan gagal (${res.status}).`,
+      body.detail,
+      'server',
+    );
   }
 
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
+    const body = await readErrorBody(res);
     throw new ApiError(
       res.status,
       body.message ?? body.detail ?? `Request failed (${res.status})`,
       body.detail,
+      'http',
     );
   }
 
   return res.json() as Promise<T>;
 }
+
 
 // ─── Loan Assessment API ─────────────────────────────────────────
 
@@ -199,6 +325,85 @@ export interface V1ApplicationDocument {
   file_path: string;
 }
 
+// ─── AI Assessment — mirrors shared/schemas/ contracts ─────────────────────
+
+export interface AiAssessmentComplianceItem {
+  requirement: string;
+  status: 'pass' | 'fail' | 'exception' | 'no_policy_found';
+  policy_citation: PolicyCitation | null;
+  notes?: string;
+}
+
+export interface AiAssessmentCompliance {
+  document_id: string;
+  items: AiAssessmentComplianceItem[];
+}
+
+export interface AiAssessmentFinanceFigure {
+  name: string;
+  value: number;
+  provenance: 'extracted' | 'calculated';
+  source_citation?: Citation | null;
+  formula_id?: string | null;
+  formula_version?: string | null;
+}
+
+export interface AiAssessmentFinance {
+  document_id: string;
+  figures: AiAssessmentFinanceFigure[];
+  assessment: string;
+  assessment_confidence: number;
+  product_term_citations: PolicyCitation[];
+}
+
+export interface AiAssessmentRisk {
+  document_id: string;
+  status: 'complete' | 'incomplete' | 'escalated';
+  component_scores: Record<string, number>;
+  overall_score: number | null;
+  qualitative_range: string | null;
+  confidence: number;
+  missing_inputs: string[];
+  escalation_reason: string | null;
+  citations: PolicyCitation[];
+}
+
+export interface AiAssessmentMarketClaim {
+  claim: string;
+  source_url: string;
+  retrieved_at: string;
+  credibility_score: number;
+}
+
+export interface AiAssessmentMarket {
+  sector: string;
+  region: string;
+  claims: AiAssessmentMarketClaim[];
+  live_search_available: boolean;
+  note: string;
+}
+
+export interface AiAssessmentRecommendation {
+  document_id: string;
+  decision: 'approve' | 'decline' | 'approve_with_conditions' | null;
+  reasoning_trail: string;
+  conditions: string[];
+  confidence: number;
+  precedent_citations: PolicyCitation[];
+  withheld_reason: string | null;
+  missing_inputs: string[];
+  has_acknowledged_violation: boolean;
+}
+
+/** Typed shape of V1ApplicationDetailOutput.ai_assessment — mirrors shared/schemas/ */
+export interface AiAssessment {
+  compliance?: AiAssessmentCompliance;
+  finance?: AiAssessmentFinance;
+  risk?: AiAssessmentRisk;
+  market?: AiAssessmentMarket;
+  recommendation?: AiAssessmentRecommendation;
+}
+
 export interface V1ApplicationDetailOutput {
   application_id: string;
   status: V1ApplicationStatus;
@@ -223,7 +428,7 @@ export interface V1ApplicationDetailOutput {
     tenure_months: number;
   };
   documents: V1ApplicationDocument[];
-  ai_assessment: Record<string, unknown>;
+  ai_assessment: AiAssessment;
   workflow: Record<string, unknown>;
 }
 
